@@ -1,0 +1,125 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+)
+
+// Config holds internal parameters for the worker pool.
+type Config struct {
+	Concurrency int
+	QueueBuffer int
+	Processor   JobProcessor
+	Logger      *slog.Logger
+}
+
+// Option is a function type that mutates Config.
+type Option func(*Config)
+
+// Functional Option builders
+func WithConcurrency(c int) Option {
+	return func(cfg *Config) {
+		if c > 0 {
+			cfg.Concurrency = c
+		}
+	}
+}
+
+func WithQueueBuffer(b int) Option {
+	return func(cfg *Config) {
+		if b > 0 {
+			cfg.QueueBuffer = b
+		}
+	}
+}
+
+func WithProcessor(p JobProcessor) Option {
+	return func(cfg *Config) {
+		cfg.Processor = p
+	}
+}
+
+func WithLogger(l *slog.Logger) Option {
+	return func(cfg *Config) {
+		cfg.Logger = l
+	}
+}
+
+// Pool represents the concurrent worker processing pool.
+type Pool struct {
+	cfg     Config
+	jobChan chan Job
+	wg      sync.WaitGroup
+}
+
+// NewPool initializes a worker pool using applied Functional Options.
+func NewPool(opts ...Option) (*Pool, error) {
+	// 1. Sensible defaults
+	cfg := Config{
+		Concurrency: 5,
+		QueueBuffer: 100,
+		Logger:      slog.Default(),
+	}
+
+	// 2. Apply all options
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	// 3. Guard assertions
+	if cfg.Processor == nil {
+		return nil, errors.New("worker pool requires a non-nil JobProcessor strategy")
+	}
+
+	return &Pool{
+		cfg:     cfg,
+		jobChan: make(chan Job, cfg.QueueBuffer),
+	}, nil
+}
+
+// Start spawns worker goroutines.
+func (p *Pool) Start(ctx context.Context) {
+	for i := 1; i <= p.cfg.Concurrency; i++ {
+		p.wg.Add(1)
+		go p.worker(ctx, i)
+	}
+	p.cfg.Logger.Info("worker pool started", slog.Int("concurrency", p.cfg.Concurrency))
+}
+
+// Submit enqueues a job into the buffered channel.
+func (p *Pool) Submit(ctx context.Context, job Job) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case p.jobChan <- job:
+		return nil
+	}
+}
+
+// Stop gracefully waits for in-flight tasks to finish.
+func (p *Pool) Stop() {
+	close(p.jobChan)
+	p.wg.Wait()
+	p.cfg.Logger.Info("worker pool stopped gracefully")
+}
+
+func (p *Pool) worker(ctx context.Context, id int) {
+	defer p.wg.Done()
+
+	for job := range p.jobChan {
+		p.cfg.Logger.Info("processing job", slog.Int("worker_id", id), slog.String("job_id", job.ID))
+
+		if err := p.cfg.Processor.Process(ctx, job); err != nil {
+			p.cfg.Logger.Error("failed to process job",
+				slog.Int("worker_id", id),
+				slog.String("job_id", job.ID),
+				slog.Any("error", err),
+			)
+			continue
+		}
+
+		p.cfg.Logger.Info("job completed successfully", slog.Int("worker_id", id), slog.String("job_id", job.ID))
+	}
+}

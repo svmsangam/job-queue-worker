@@ -1,0 +1,22 @@
+syntax = "proto3";
+package processor.v1;
+
+option go_package = "job-queue/api/proto/v1;processorv1";
+
+// Request data
+message ProcessRequest {
+    string job_id = 1;
+    bytes payload = 2;
+    int32 timeout_seconds = 3;
+}
+
+// Response data
+message ProcessResponse {
+    bool success = 1;
+    string output = 2;
+    string error_message = 3;
+}
+
+service ProcessorService{
+    rpc ProcessJob (ProcessRequest) returns (ProcessResponse) {}
+}
