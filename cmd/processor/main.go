@@ -14,7 +14,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
 
@@ -110,7 +109,7 @@ func main() {
 
 	server := newProcessorServer(logger)
 	pb.RegisterProcessorServiceServer(grpcServer, server)
-	reflection.Register(grpcServer)
+	//reflection.Register(grpcServer)
 
 	// Graceful shutdown listener
 	stopChan := make(chan os.Signal, 1)

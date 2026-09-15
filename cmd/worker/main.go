@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -12,7 +11,6 @@ import (
 )
 
 func main() {
-	// Initialize structured logger
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -26,13 +24,14 @@ func main() {
 	}
 	defer client.Close()
 
-	// 2. Instantiate strategy pattern processor
+	// 2. Instantiate gRPC Job Processor Strategy
 	processor := worker.NewGRPCJobProcessor(client)
 
-	// 3. Initialize worker pool using Functional Options
+	// 3. Initialize Worker Pool with Retries and Options
 	pool, err := worker.NewPool(
-		worker.WithConcurrency(3),  // 3 parallel worker goroutines
-		worker.WithQueueBuffer(10), // shock-absorber buffer channel size
+		worker.WithConcurrency(3),
+		worker.WithQueueBuffer(50),
+		worker.WithMaxRetries(3),
 		worker.WithProcessor(processor),
 		worker.WithLogger(logger),
 	)
@@ -41,38 +40,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Context for managing pool lifecycle
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 4. Start worker goroutines
+	// 4. Start Worker Goroutines
 	pool.Start(ctx)
 
-	// 5. Submit sample batch of jobs concurrently
-	go func() {
-		for i := 1; i <= 6; i++ {
-			job := worker.Job{
-				ID:      fmt.Sprintf("job-%03d", i),
-				Type:    "DATA_PROCESSING",
-				Payload: []byte(fmt.Sprintf(`{"payload_id": %d}`, i)),
-			}
+	// 5. Start Kafka Consumer Loop
+	brokers := []string{"localhost:9092"}
+	consumer := worker.NewConsumer(brokers, "jobs.v1", "worker-group-1", pool, logger)
+	defer consumer.Close()
 
-			if err := pool.Submit(ctx, job); err != nil {
-				logger.Error("failed to submit job", slog.String("job_id", job.ID), slog.Any("error", err))
-			} else {
-				logger.Info("job enqueued", slog.String("job_id", job.ID))
-			}
+	go func() {
+		if err := consumer.Start(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("consumer stopped unexpectedly", slog.Any("error", err))
 		}
 	}()
 
-	// 6. Graceful shutdown handler
+	// 6. Handle Graceful Shutdown
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
 	<-stopChan
-	logger.Info("shutdown signal received, stopping worker pool...")
+	logger.Info("shutdown signal received, stopping services...")
 
-	// Drain remaining buffered jobs before exit
-	pool.Stop()
-	logger.Info("worker service stopped cleanly")
+	cancel()    // Stops Kafka consumer polling loop
+	pool.Stop() // Drains in-flight worker channel jobs
+	logger.Info("worker service shut down cleanly")
 }

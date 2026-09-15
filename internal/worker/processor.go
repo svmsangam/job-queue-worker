@@ -10,6 +10,7 @@ type Job struct {
 	ID      string
 	Type    string
 	Payload []byte
+	Ack     func(ctx context.Context) error `json:"-"`
 }
 
 // JobProcessor defines the strategy interface for processing jobs.
