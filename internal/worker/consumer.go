@@ -65,6 +65,10 @@ func (c *Consumer) Start(ctx context.Context) error {
 			}
 
 			// Attach Ack callback: Commits Kafka offset after worker successfully completes processing
+			c.logger.Info("recieved job from kafka",
+				slog.String("job_id", job.ID),
+				slog.String("topic", c.reader.Config().Topic))
+
 			msgToCommit := msg
 			job.Ack = func(ackCtx context.Context) error {
 				return c.reader.CommitMessages(ackCtx, msgToCommit)

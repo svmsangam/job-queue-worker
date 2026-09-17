@@ -11,11 +11,12 @@ import (
 
 // Config holds internal parameters for the worker pool.
 type Config struct {
-	Concurrency int
-	QueueBuffer int
-	MaxRetries  int
-	Processor   JobProcessor
-	Logger      *slog.Logger
+	Concurrency  int
+	QueueBuffer  int
+	MaxRetries   int
+	Processor    JobProcessor
+	DLQPublisher DLQPublisher
+	Logger       *slog.Logger
 }
 
 // Option is a function type that mutates Config.
@@ -54,6 +55,12 @@ func WithProcessor(p JobProcessor) Option {
 func WithLogger(l *slog.Logger) Option {
 	return func(cfg *Config) {
 		cfg.Logger = l
+	}
+}
+
+func WithDLQ(publisher DLQPublisher) Option {
+	return func(cfg *Config) {
+		cfg.DLQPublisher = publisher
 	}
 }
 
@@ -126,6 +133,18 @@ func (p *Pool) worker(ctx context.Context, id int) {
 				slog.String("job_id", job.ID),
 				slog.Any("error", err),
 			)
+			// Route failed job to DLQ if configured
+			if p.cfg.DLQPublisher != nil {
+				if dlqErr := p.cfg.DLQPublisher.PublishDLQ(ctx, job, err, p.cfg.MaxRetries); dlqErr != nil {
+					p.cfg.Logger.Error("failed to publish job to DLQ",
+						slog.String("job_id", job.ID),
+						slog.Any("error", dlqErr),
+					)
+					// Skip Ack if DLQ fails so message will be retried on consumer restart
+					continue
+				}
+			}
+
 			// Non-committed offsets will cause Kafka to redeliver this message to another consumer on restart
 			continue
 		}

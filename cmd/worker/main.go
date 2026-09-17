@@ -27,12 +27,22 @@ func main() {
 	// 2. Instantiate gRPC Job Processor Strategy
 	processor := worker.NewGRPCJobProcessor(client)
 
-	// 3. Initialize Worker Pool with Retries and Options
+	// 3. Ensure jobs.dlq exists before workers try to publish failed tasks
+	if err := worker.EnsureTopicExists("localhost:9092", "jobs.dlq", 3, 1); err != nil {
+		logger.Warn("dlq topic auto-creation skipped or topic exists", slog.Any("error", err))
+	}
+
+	// 4. Now initialize the DLQ Publisher safely
+	dlqPublisher := worker.NewKafkaDLQPublisher([]string{"localhost:9092"}, "jobs.dlq", logger)
+	defer dlqPublisher.Close()
+
+	// 5. Initialize Worker Pool with Retries and Options
 	pool, err := worker.NewPool(
 		worker.WithConcurrency(3),
 		worker.WithQueueBuffer(50),
 		worker.WithMaxRetries(3),
 		worker.WithProcessor(processor),
+		worker.WithDLQ(dlqPublisher),
 		worker.WithLogger(logger),
 	)
 	if err != nil {
