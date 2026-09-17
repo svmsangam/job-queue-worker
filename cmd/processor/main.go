@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -49,17 +48,17 @@ func (s *processorServer) ProcessJob(ctx context.Context, req *pb.ProcessRequest
 	// Simulate work duration
 	time.Sleep(100 * time.Millisecond)
 
-	return &pb.ProcessResponse{
-		Success:      false,
-		Output:       fmt.Sprintf("failed to process job %s", req.GetJobId()),
-		ErrorMessage: "",
-	}, errors.New("simulated processing failure")
-
 	// return &pb.ProcessResponse{
-	// 	Success:      true,
-	// 	Output:       fmt.Sprintf("successfully processed job %s", req.GetJobId()),
+	// 	Success:      false,
+	// 	Output:       fmt.Sprintf("failed to process job %s", req.GetJobId()),
 	// 	ErrorMessage: "",
-	// }, nil
+	// }, errors.New("simulated processing failure")
+
+	return &pb.ProcessResponse{
+		Success:      true,
+		Output:       fmt.Sprintf("successfully processed job %s", req.GetJobId()),
+		ErrorMessage: "",
+	}, nil
 }
 
 // loggingInterceptor logs incoming gRPC requests, duration, and completion status.
