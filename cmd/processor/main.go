@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pb "job-queue/api/proto/v1"
+	"job-queue/pkg/logger"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -96,10 +97,12 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 }
 
 func main() {
-	// Initialize structured JSON logger
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "processor", Level: slog.LevelInfo})
+	if err != nil {
+		panic(err)
+	}
+	defer logHandler.Close(context.Background())
+	logger := slog.New(logHandler)
 
 	port := ":50051"
 	listener, err := net.Listen("tcp", port)

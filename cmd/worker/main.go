@@ -8,12 +8,16 @@ import (
 	"syscall"
 
 	"job-queue/internal/worker"
+	"job-queue/pkg/logger"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "worker", Level: slog.LevelInfo})
+	if err != nil {
+		panic(err)
+	}
+	defer logHandler.Close(context.Background())
+	logger := slog.New(logHandler)
 
 	// 1. Establish gRPC client connection pool
 	grpcTarget := "localhost:50051"

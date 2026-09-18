@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"job-queue/internal/producer"
 	"job-queue/internal/worker"
+	"job-queue/pkg/logger"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "producer", Level: slog.LevelInfo})
+	if err != nil {
+		panic(err)
+	}
+	defer logHandler.Close(context.Background())
+	logger := slog.New(logHandler)
 
 	brokers := []string{"localhost:9092"}
 	topic := "jobs.v1"

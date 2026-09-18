@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"job-queue/internal/producer"
+	"job-queue/pkg/logger"
 )
 
 const (
@@ -106,9 +107,12 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "api", Level: slog.LevelInfo})
+	if err != nil {
+		panic(err)
+	}
+	defer logHandler.Close(context.Background())
+	logger := slog.New(logHandler)
 
 	jobProducer := producer.NewKafkaProducer([]string{kafkaBroker}, kafkaTopic, logger)
 	defer jobProducer.Close()
