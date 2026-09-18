@@ -2,13 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"job-queue/internal/worker"
 	"job-queue/pkg/logger"
+	"job-queue/pkg/metrics"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -18,6 +24,13 @@ func main() {
 	}
 	defer logHandler.Close(context.Background())
 	logger := slog.New(logHandler)
+	serviceMetrics := metrics.New()
+	metricsServer := &http.Server{Addr: ":2112", Handler: promhttp.HandlerFor(serviceMetrics.Registry, promhttp.HandlerOpts{})}
+	go func() {
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server stopped unexpectedly", slog.Any("error", err))
+		}
+	}()
 
 	// 1. Establish gRPC client connection pool
 	grpcTarget := "localhost:50051"
@@ -48,6 +61,7 @@ func main() {
 		worker.WithProcessor(processor),
 		worker.WithDLQ(dlqPublisher),
 		worker.WithLogger(logger),
+		worker.WithMetrics(serviceMetrics),
 	)
 	if err != nil {
 		logger.Error("failed to initialize worker pool", slog.Any("error", err))
@@ -80,5 +94,10 @@ func main() {
 
 	cancel()    // Stops Kafka consumer polling loop
 	pool.Stop() // Drains in-flight worker channel jobs
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("failed to shut down metrics server", slog.Any("error", err))
+	}
 	logger.Info("worker service shut down cleanly")
 }

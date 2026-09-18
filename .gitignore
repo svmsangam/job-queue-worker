@@ -1,3 +1,6 @@
 # Generated Protobuf / gRPC Go files
 *_grpc.pb.go
 *.pb.go
+
+# Generated logger output
+/pkg/logger/*.txt

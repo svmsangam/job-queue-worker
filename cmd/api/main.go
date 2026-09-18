@@ -15,6 +15,9 @@ import (
 
 	"job-queue/internal/producer"
 	"job-queue/pkg/logger"
+	"job-queue/pkg/metrics"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -113,6 +116,7 @@ func main() {
 	}
 	defer logHandler.Close(context.Background())
 	logger := slog.New(logHandler)
+	serviceMetrics := metrics.New()
 
 	jobProducer := producer.NewKafkaProducer([]string{kafkaBroker}, kafkaTopic, logger)
 	defer jobProducer.Close()
@@ -121,6 +125,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", jobAPI.handleHealth)
 	mux.HandleFunc("POST /v1/jobs", jobAPI.handleCreateJob)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(serviceMetrics.Registry, promhttp.HandlerOpts{}))
 
 	server := &http.Server{
 		Addr:              listenAddr,

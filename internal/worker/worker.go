@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"job-queue/pkg/metrics"
 )
 
 // Config holds internal parameters for the worker pool.
@@ -17,6 +19,7 @@ type Config struct {
 	Processor    JobProcessor
 	DLQPublisher DLQPublisher
 	Logger       *slog.Logger
+	Metrics      *metrics.Metrics
 }
 
 // Option is a function type that mutates Config.
@@ -64,11 +67,17 @@ func WithDLQ(publisher DLQPublisher) Option {
 	}
 }
 
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(cfg *Config) { cfg.Metrics = m }
+}
+
 // Pool represents the concurrent worker processing pool.
 type Pool struct {
-	cfg     Config
-	jobChan chan Job
-	wg      sync.WaitGroup
+	cfg      Config
+	jobChan  chan Job
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // NewPool initializes a worker pool using applied Functional Options.
@@ -78,10 +87,14 @@ func NewPool(opts ...Option) (*Pool, error) {
 		QueueBuffer: 100,
 		MaxRetries:  3,
 		Logger:      slog.Default(),
+		Metrics:     metrics.New(),
 	}
 
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.New()
 	}
 
 	if cfg.Processor == nil {
@@ -91,6 +104,7 @@ func NewPool(opts ...Option) (*Pool, error) {
 	return &Pool{
 		cfg:     cfg,
 		jobChan: make(chan Job, cfg.QueueBuffer),
+		stopCh:  make(chan struct{}),
 	}, nil
 }
 
@@ -105,9 +119,14 @@ func (p *Pool) Start(ctx context.Context) {
 
 // Submit enqueues a job into the buffered channel.
 func (p *Pool) Submit(ctx context.Context, job Job) error {
+	p.cfg.Metrics.QueueDepth.Inc()
 	select {
 	case <-ctx.Done():
+		p.cfg.Metrics.QueueDepth.Dec()
 		return ctx.Err()
+	case <-p.stopCh:
+		p.cfg.Metrics.QueueDepth.Dec()
+		return errors.New("worker pool is stopped")
 	case p.jobChan <- job:
 		return nil
 	}
@@ -115,7 +134,7 @@ func (p *Pool) Submit(ctx context.Context, job Job) error {
 
 // Stop gracefully waits for in-flight tasks to finish.
 func (p *Pool) Stop() {
-	close(p.jobChan)
+	p.stopOnce.Do(func() { close(p.stopCh) })
 	p.wg.Wait()
 	p.cfg.Logger.Info("worker pool stopped gracefully")
 }
@@ -123,45 +142,71 @@ func (p *Pool) Stop() {
 func (p *Pool) worker(ctx context.Context, id int) {
 	defer p.wg.Done()
 
-	for job := range p.jobChan {
-		p.cfg.Logger.Info("processing job", slog.Int("worker_id", id), slog.String("job_id", job.ID))
-
-		err := p.executeWithRetry(ctx, job, id)
-		if err != nil {
-			p.cfg.Logger.Error("job failed permanently after retries",
-				slog.Int("worker_id", id),
-				slog.String("job_id", job.ID),
-				slog.Any("error", err),
-			)
-			// Route failed job to DLQ if configured
-			if p.cfg.DLQPublisher != nil {
-				if dlqErr := p.cfg.DLQPublisher.PublishDLQ(ctx, job, err, p.cfg.MaxRetries); dlqErr != nil {
-					p.cfg.Logger.Error("failed to publish job to DLQ",
-						slog.String("job_id", job.ID),
-						slog.Any("error", dlqErr),
-					)
-					// Skip Ack if DLQ fails so message will be retried on consumer restart
-					continue
+	for {
+		select {
+		case job := <-p.jobChan:
+			p.processJob(ctx, job, id)
+		case <-p.stopCh:
+			for {
+				select {
+				case job := <-p.jobChan:
+					p.processJob(ctx, job, id)
+				default:
+					return
 				}
 			}
-
-			// Non-committed offsets will cause Kafka to redeliver this message to another consumer on restart
-			continue
 		}
+	}
+}
 
-		// Execute acknowledgment callback (commits offset in Kafka) ONLY after successful execution
-		if job.Ack != nil {
-			if ackErr := job.Ack(ctx); ackErr != nil {
-				p.cfg.Logger.Error("failed to acknowledge job completion",
+func (p *Pool) processJob(ctx context.Context, job Job, id int) {
+	p.cfg.Metrics.QueueDepth.Dec()
+	p.cfg.Metrics.ActiveWorkers.Inc()
+	started := time.Now()
+	defer func() {
+		p.cfg.Metrics.ActiveWorkers.Dec()
+		p.cfg.Metrics.JobDuration.Add(time.Since(started).Seconds())
+	}()
+
+	p.cfg.Logger.Info("processing job", slog.Int("worker_id", id), slog.String("job_id", job.ID))
+
+	err := p.executeWithRetry(ctx, job, id)
+	if err != nil {
+		p.cfg.Metrics.JobFailed.Inc()
+		p.cfg.Logger.Error("job failed permanently after retries",
+			slog.Int("worker_id", id),
+			slog.String("job_id", job.ID),
+			slog.Any("error", err),
+		)
+		// Route failed job to DLQ if configured
+		if p.cfg.DLQPublisher != nil {
+			if dlqErr := p.cfg.DLQPublisher.PublishDLQ(ctx, job, err, p.cfg.MaxRetries); dlqErr != nil {
+				p.cfg.Logger.Error("failed to publish job to DLQ",
 					slog.String("job_id", job.ID),
-					slog.Any("error", ackErr),
+					slog.Any("error", dlqErr),
 				)
-				continue
+				// Skip Ack if DLQ fails so message will be retried on consumer restart
+				return
 			}
 		}
-
-		p.cfg.Logger.Info("job completed successfully", slog.Int("worker_id", id), slog.String("job_id", job.ID))
+		// Non-committed offsets will cause Kafka to redeliver this message to another consumer on restart
+		return
 	}
+
+	// Execute acknowledgment callback (commits offset in Kafka) ONLY after successful execution
+	if job.Ack != nil {
+		if ackErr := job.Ack(ctx); ackErr != nil {
+			p.cfg.Logger.Error("failed to acknowledge job completion",
+				slog.String("job_id", job.ID),
+				slog.Any("error", ackErr),
+			)
+			p.cfg.Metrics.JobFailed.Inc()
+			return
+		}
+	}
+
+	p.cfg.Metrics.JobProcessed.Inc()
+	p.cfg.Logger.Info("job completed successfully", slog.Int("worker_id", id), slog.String("job_id", job.ID))
 }
 
 // executeWithRetry executes the strategy with exponential backoff retries.
