@@ -1,3 +1,5 @@
+// Package main is a Kafka producer smoke-test command that serializes a small
+// batch of representative jobs and publishes them to the worker topic.
 package main
 
 import (
@@ -12,6 +14,8 @@ import (
 	"job-queue/pkg/logger"
 )
 
+// main creates a bounded publish context and sends test jobs through Kafka.
+// Command -> JSON job -> keyed Kafka message -> worker consumer.
 func main() {
 	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "producer", Level: slog.LevelInfo})
 	if err != nil {

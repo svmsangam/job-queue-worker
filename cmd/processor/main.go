@@ -1,3 +1,5 @@
+// Package main exposes the gRPC processor service. It validates requests,
+// performs the domain work, and reports structured request outcomes.
 package main
 
 import (
@@ -19,16 +21,19 @@ import (
 )
 
 // processorServer implements the generated ProcessorServiceServer interface.
+// Worker pool -> gRPC request -> processorServer -> processing response.
 type processorServer struct {
 	pb.UnimplementedProcessorServiceServer
 	logger *slog.Logger
 }
 
+// newProcessorServer wires logging into the gRPC service implementation.
 func newProcessorServer(logger *slog.Logger) *processorServer {
 	return &processorServer{logger: logger}
 }
 
-// ProcessJob handles incoming processing requests.
+// ProcessJob handles incoming processing requests after checking cancellation
+// and required identifiers. Worker gRPC call -> validation/work -> response.
 func (s *processorServer) ProcessJob(ctx context.Context, req *pb.ProcessRequest) (*pb.ProcessResponse, error) {
 	// 1. Enforce context deadline check
 	select {
@@ -62,7 +67,8 @@ func (s *processorServer) ProcessJob(ctx context.Context, req *pb.ProcessRequest
 	}, nil
 }
 
-// loggingInterceptor logs incoming gRPC requests, duration, and completion status.
+// loggingInterceptor records gRPC method, status, error, and duration around
+// each handler without changing the handler response.
 func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
@@ -96,6 +102,8 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 	}
 }
 
+// main starts the gRPC processor and uses a buffered signal channel to receive
+// one OS shutdown notification before graceful server termination.
 func main() {
 	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "processor", Level: slog.LevelInfo})
 	if err != nil {

@@ -1,3 +1,5 @@
+// Package worker owns the asynchronous job execution pipeline, including the
+// Kafka consumer that feeds jobs into the bounded worker pool.
 package worker
 
 import (
@@ -14,6 +16,8 @@ type Consumer struct {
 	logger *slog.Logger
 }
 
+// NewConsumer creates a manual-commit Kafka reader. Offsets are committed only
+// by the Job Ack callback after the pool completes processing successfully.
 func NewConsumer(brokers []string, topic string, groupID string, pool *Pool, logger *slog.Logger) *Consumer {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        brokers,
@@ -32,6 +36,8 @@ func NewConsumer(brokers []string, topic string, groupID string, pool *Pool, log
 	}
 }
 
+// Start fetches Kafka records, decodes them, and submits them to the pool.
+// Kafka -> JSON Job -> buffered worker queue -> processor -> offset commit.
 func (c *Consumer) Start(ctx context.Context) error {
 	c.logger.Info("kafka consumer starting",
 		slog.String("topic", c.reader.Config().Topic),
@@ -85,6 +91,7 @@ func (c *Consumer) Start(ctx context.Context) error {
 	}
 }
 
+// Close releases the Kafka reader and stops its network resources.
 func (c *Consumer) Close() error {
 	if c.reader != nil {
 		return c.reader.Close()

@@ -1,3 +1,5 @@
+// Package worker owns the asynchronous job execution pipeline and its gRPC
+// adapter to the processor service.
 package worker
 
 import (
@@ -18,7 +20,8 @@ type ProcessorClient struct {
 	logger *slog.Logger
 }
 
-// NewProcessorClient establishes a reusable gRPC connection pool.
+// NewProcessorClient establishes a reusable gRPC connection. grpc.ClientConn
+// multiplexes concurrent worker calls, avoiding one connection per job.
 func NewProcessorClient(target string, logger *slog.Logger) (*ProcessorClient, error) {
 	// Configure transport credentials (insecure for internal microservice communication)
 	conn, err := grpc.NewClient(
@@ -36,7 +39,8 @@ func NewProcessorClient(target string, logger *slog.Logger) (*ProcessorClient, e
 	}, nil
 }
 
-// Process executes the gRPC call with a strict context deadline.
+// Process executes one worker job as a gRPC call with a strict child deadline.
+// The child context bounds downstream work while preserving parent shutdown.
 func (c *ProcessorClient) Process(ctx context.Context, jobID string, payload []byte, timeout time.Duration) (*pb.ProcessResponse, error) {
 	// Enforce strict timeout per outbound request
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, timeout)
@@ -56,7 +60,7 @@ func (c *ProcessorClient) Process(ctx context.Context, jobID string, payload []b
 	return resp, nil
 }
 
-// Close gracefully closes the underlying connection pool.
+// Close gracefully closes the reusable gRPC connection.
 func (c *ProcessorClient) Close() error {
 	if c.conn != nil {
 		return c.conn.Close()

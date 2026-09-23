@@ -1,3 +1,7 @@
+// Package worker owns the asynchronous job execution pipeline. It decouples
+// Kafka polling from processing with a bounded channel, runs a fixed number of
+// goroutines, retries transient failures, and routes permanent failures to a
+// dead-letter publisher before acknowledging the source message.
 package worker
 
 import (
@@ -11,7 +15,8 @@ import (
 	"job-queue/pkg/metrics"
 )
 
-// Config holds internal parameters for the worker pool.
+// Config holds the worker pool's concurrency, buffering, retry, processing,
+// dead-letter, logging, and metrics dependencies.
 type Config struct {
 	Concurrency  int
 	QueueBuffer  int
@@ -22,9 +27,10 @@ type Config struct {
 	Metrics      *metrics.Metrics
 }
 
-// Option is a function type that mutates Config.
+// Option mutates a Pool configuration during construction.
 type Option func(*Config)
 
+// WithConcurrency sets the number of jobs processed in parallel.
 func WithConcurrency(c int) Option {
 	return func(cfg *Config) {
 		if c > 0 {
@@ -33,6 +39,8 @@ func WithConcurrency(c int) Option {
 	}
 }
 
+// WithQueueBuffer sets the capacity of the channel between Kafka and workers.
+// The buffer absorbs short bursts while still applying backpressure when full.
 func WithQueueBuffer(b int) Option {
 	return func(cfg *Config) {
 		if b > 0 {
@@ -41,6 +49,7 @@ func WithQueueBuffer(b int) Option {
 	}
 }
 
+// WithMaxRetries sets the number of processor attempts for each job.
 func WithMaxRetries(r int) Option {
 	return func(cfg *Config) {
 		if r >= 0 {
@@ -49,29 +58,36 @@ func WithMaxRetries(r int) Option {
 	}
 }
 
+// WithProcessor supplies the strategy that performs the actual job work.
 func WithProcessor(p JobProcessor) Option {
 	return func(cfg *Config) {
 		cfg.Processor = p
 	}
 }
 
+// WithLogger supplies the structured logger used by the pool.
 func WithLogger(l *slog.Logger) Option {
 	return func(cfg *Config) {
 		cfg.Logger = l
 	}
 }
 
+// WithDLQ supplies the publisher used after all processing attempts fail.
 func WithDLQ(publisher DLQPublisher) Option {
 	return func(cfg *Config) {
 		cfg.DLQPublisher = publisher
 	}
 }
 
+// WithMetrics supplies the Prometheus collectors updated by the pool.
 func WithMetrics(m *metrics.Metrics) Option {
 	return func(cfg *Config) { cfg.Metrics = m }
 }
 
-// Pool represents the concurrent worker processing pool.
+// Pool represents the concurrent worker processing pool. jobChan provides
+// bounded handoff and backpressure; stopCh broadcasts shutdown; sync.Once
+// makes Stop idempotent; and the WaitGroup ensures every worker has drained
+// before shutdown returns.
 type Pool struct {
 	cfg      Config
 	jobChan  chan Job
@@ -80,7 +96,8 @@ type Pool struct {
 	wg       sync.WaitGroup
 }
 
-// NewPool initializes a worker pool using applied Functional Options.
+// NewPool initializes a worker pool using functional options and rejects a
+// missing processor because workers cannot make progress without a strategy.
 func NewPool(opts ...Option) (*Pool, error) {
 	cfg := Config{
 		Concurrency: 5,
@@ -108,7 +125,8 @@ func NewPool(opts ...Option) (*Pool, error) {
 	}, nil
 }
 
-// Start spawns worker goroutines.
+// Start spawns the configured workers. Kafka consumer -> buffered jobChan ->
+// worker goroutine -> processor/DLQ -> optional Kafka offset acknowledgment.
 func (p *Pool) Start(ctx context.Context) {
 	for i := 1; i <= p.cfg.Concurrency; i++ {
 		p.wg.Add(1)
@@ -117,7 +135,9 @@ func (p *Pool) Start(ctx context.Context) {
 	p.cfg.Logger.Info("worker pool started", slog.Int("concurrency", p.cfg.Concurrency))
 }
 
-// Submit enqueues a job into the buffered channel.
+// Submit enqueues a job or returns when the caller's context is canceled or
+// the pool has stopped. The select prevents a blocked producer from surviving
+// shutdown indefinitely.
 func (p *Pool) Submit(ctx context.Context, job Job) error {
 	p.cfg.Metrics.QueueDepth.Inc()
 	select {
@@ -132,13 +152,16 @@ func (p *Pool) Submit(ctx context.Context, job Job) error {
 	}
 }
 
-// Stop gracefully waits for in-flight tasks to finish.
+// Stop closes the shutdown broadcast once and waits for workers to drain jobs
+// already accepted into the channel. It does not interrupt a running job.
 func (p *Pool) Stop() {
 	p.stopOnce.Do(func() { close(p.stopCh) })
 	p.wg.Wait()
 	p.cfg.Logger.Info("worker pool stopped gracefully")
 }
 
+// worker consumes jobs until shutdown, then drains the buffered channel before
+// returning so accepted work is not abandoned during a graceful stop.
 func (p *Pool) worker(ctx context.Context, id int) {
 	defer p.wg.Done()
 
@@ -159,6 +182,8 @@ func (p *Pool) worker(ctx context.Context, id int) {
 	}
 }
 
+// processJob executes one job, updates concurrent metrics, publishes permanent
+// failures to the DLQ, and acknowledges Kafka only after successful processing.
 func (p *Pool) processJob(ctx context.Context, job Job, id int) {
 	p.cfg.Metrics.QueueDepth.Dec()
 	p.cfg.Metrics.ActiveWorkers.Inc()
@@ -210,6 +235,7 @@ func (p *Pool) processJob(ctx context.Context, job Job, id int) {
 }
 
 // executeWithRetry executes the strategy with exponential backoff retries.
+// Context cancellation interrupts the backoff so shutdown remains responsive.
 func (p *Pool) executeWithRetry(ctx context.Context, job Job, workerID int) error {
 	var err error
 	backoff := 200 * time.Millisecond

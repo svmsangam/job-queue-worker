@@ -1,3 +1,5 @@
+// Package main assembles the worker service: gRPC client, retrying worker pool,
+// Kafka consumer, DLQ publisher, and Prometheus metrics endpoint.
 package main
 
 import (
@@ -17,6 +19,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// main starts service dependencies in data-flow order and coordinates graceful
+// shutdown. Kafka -> consumer -> worker pool -> gRPC processor/DLQ.
 func main() {
 	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "worker", Level: slog.LevelInfo})
 	if err != nil {
