@@ -1,3 +1,5 @@
+// Package main exposes the HTTP ingress service. It validates JSON job
+// requests, publishes them to Kafka, and exposes health and Prometheus routes.
 package main
 
 import (
@@ -43,10 +45,13 @@ type apiServer struct {
 	logger   *slog.Logger
 }
 
+// handleHealth reports liveness without touching the Kafka dependency.
 func (s *apiServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// handleCreateJob validates an HTTP request and enqueues it. HTTP JSON request
+// -> keyed Kafka message -> worker consumer; the response confirms enqueue.
 func (s *apiServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	var request jobRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
@@ -99,16 +104,20 @@ func (s *apiServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// writeJSON encodes a response with the service's JSON content type.
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// writeError returns a consistent JSON error envelope.
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
+// main starts the HTTP API and metrics endpoint, then gracefully shuts them
+// down when the process receives SIGINT or SIGTERM.
 func main() {
 	logHandler, err := logger.New(logger.Config{LokiURL: "http://localhost:3100/loki/api/v1/push", Service: "api", Level: slog.LevelInfo})
 	if err != nil {

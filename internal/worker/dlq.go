@@ -1,3 +1,5 @@
+// Package worker owns the asynchronous job execution pipeline, including
+// durable dead-letter handling for jobs that exhaust their retry budget.
 package worker
 
 import (
@@ -12,7 +14,8 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// DLQMessage represents the structured payload sent to the dead-letter topic.
+// DLQMessage represents the structured payload sent to the dead-letter topic,
+// preserving the original job and failure metadata for later inspection.
 type DLQMessage struct {
 	OriginalJob Job       `json:"original_job"`
 	ErrorReason string    `json:"error_reason"`
@@ -20,7 +23,8 @@ type DLQMessage struct {
 	Attempts    int       `json:"attempts"`
 }
 
-// DLQPublisher defines the interface for forwarding unprocessable jobs.
+// DLQPublisher defines the interface for forwarding unprocessable jobs before
+// their source offsets are acknowledged.
 type DLQPublisher interface {
 	PublishDLQ(ctx context.Context, job Job, reason error, attempts int) error
 	Close() error
@@ -31,6 +35,8 @@ type KafkaDLQPublisher struct {
 	logger *slog.Logger
 }
 
+// EnsureTopicExists asks the Kafka controller to create the DLQ topic before
+// workers start publishing permanent failures.
 func EnsureTopicExists(brokerHostPort string, topic string, numPartitions int, replicationFactor int) error {
 	conn, err := kafka.Dial("tcp", brokerHostPort)
 	if err != nil {
@@ -65,7 +71,8 @@ func EnsureTopicExists(brokerHostPort string, topic string, numPartitions int, r
 	return nil
 }
 
-// NewKafkaDLQPublisher initializes a Kafka writer directed at the DLQ topic.
+// NewKafkaDLQPublisher initializes a synchronous Kafka writer directed at the
+// DLQ topic, ensuring publication completes before the caller can acknowledge.
 func NewKafkaDLQPublisher(brokers []string, dlqTopic string, logger *slog.Logger) *KafkaDLQPublisher {
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
@@ -81,6 +88,7 @@ func NewKafkaDLQPublisher(brokers []string, dlqTopic string, logger *slog.Logger
 	}
 }
 
+// PublishDLQ serializes a failed job and publishes it with the job ID as key.
 func (p *KafkaDLQPublisher) PublishDLQ(ctx context.Context, job Job, reason error, attempts int) error {
 	dlqPayload := DLQMessage{
 		OriginalJob: job,
@@ -113,6 +121,7 @@ func (p *KafkaDLQPublisher) PublishDLQ(ctx context.Context, job Job, reason erro
 	return nil
 }
 
+// Close flushes pending DLQ writes and closes the Kafka writer.
 func (p *KafkaDLQPublisher) Close() error {
 	if p.writer != nil {
 		return p.writer.Close()

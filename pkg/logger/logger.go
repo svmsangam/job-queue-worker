@@ -1,3 +1,6 @@
+// Package logger provides a fan-out slog.Handler for console, daily local
+// files, and optional asynchronous Loki delivery. It keeps remote logging
+// off request and worker paths while retaining bounded shutdown semantics.
 package logger
 
 import (
@@ -23,7 +26,8 @@ const (
 	defaultFlushEvery = 200 * time.Millisecond
 )
 
-// Config controls the local file and Loki outputs.
+// Config controls the local file and Loki outputs, including the bounded Loki
+// channel and batch flush policy.
 type Config struct {
 	LogDir        string
 	LokiURL       string
@@ -35,8 +39,9 @@ type Config struct {
 	Level         slog.Level
 }
 
-// Handler fans each record out to all configured handlers. Its child handlers
-// are immutable, so Handle can safely be called concurrently.
+// Handler fans each record out to all configured handlers. Child handlers are
+// immutable, while atomic.Bool makes closed-state checks safe across callers
+// and sync.Once makes Close idempotent during competing shutdown paths.
 type Handler struct {
 	handlers []slog.Handler
 	closed   *atomic.Bool
@@ -44,7 +49,9 @@ type Handler struct {
 	closeErr error
 }
 
-// New creates a handler with a daily local file and asynchronous Loki output.
+// New creates a handler with console and daily local-file output plus optional
+// asynchronous Loki output. Application log -> bounded LogChan -> batcher ->
+// Loki HTTP request.
 func New(cfg Config) (*Handler, error) {
 	if cfg.LogDir == "" {
 		cfg.LogDir = filepath.Join("pkg", "logger")
@@ -76,6 +83,7 @@ func New(cfg Config) (*Handler, error) {
 	}, nil
 }
 
+// Enabled reports whether at least one configured child accepts the level.
 func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 	for _, handler := range h.handlers {
 		if handler.Enabled(ctx, level) {
@@ -85,6 +93,7 @@ func (h *Handler) Enabled(ctx context.Context, level slog.Level) bool {
 	return false
 }
 
+// Handle fans one record out to every enabled child handler and joins errors.
 func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 	if h.closed != nil && h.closed.Load() {
 		return errors.New("logger is closed")
@@ -100,6 +109,7 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 	return errors.Join(errs...)
 }
 
+// WithAttrs returns a handler whose children include the supplied attributes.
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	children := make([]slog.Handler, len(h.handlers))
 	for i, handler := range h.handlers {
@@ -108,6 +118,8 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &Handler{handlers: children, closed: h.closed}
 }
 
+// WithGroup returns a handler whose children write subsequent attributes in a
+// named group.
 func (h *Handler) WithGroup(name string) slog.Handler {
 	children := make([]slog.Handler, len(h.handlers))
 	for i, handler := range h.handlers {
@@ -116,8 +128,8 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	return &Handler{handlers: children, closed: h.closed}
 }
 
-// Close drains the Loki queue and closes the current local file. A timeout
-// cancels in-flight Loki requests and returns without blocking forever.
+// Close drains the Loki queue and closes the current local file. The caller's
+// context bounds in-flight Loki requests so shutdown cannot block forever.
 func (h *Handler) Close(ctx context.Context) error {
 	h.once.Do(func() {
 		h.closed.Store(true)
@@ -133,6 +145,7 @@ func (h *Handler) Close(ctx context.Context) error {
 }
 
 type fileState struct {
+	// mu serializes daily rotation and writes to the shared file handle.
 	mu    sync.Mutex
 	dir   string
 	level slog.Level
@@ -145,6 +158,7 @@ type fileHandler struct {
 	configure func(slog.Handler) slog.Handler
 }
 
+// newFileHandler creates the shared state used by all derived file handlers.
 func newFileHandler(dir string, level slog.Level) (*fileHandler, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create log directory: %w", err)
@@ -152,10 +166,12 @@ func newFileHandler(dir string, level slog.Level) (*fileHandler, error) {
 	return &fileHandler{state: &fileState{dir: dir, level: level}}, nil
 }
 
+// Enabled reports whether the file handler accepts the requested level.
 func (h *fileHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.state.level
 }
 
+// Handle rotates the daily file when needed and writes the structured record.
 func (h *fileHandler) Handle(_ context.Context, record slog.Record) error {
 	h.state.mu.Lock()
 	defer h.state.mu.Unlock()
@@ -211,6 +227,8 @@ func (h *fileHandler) Close(context.Context) error {
 }
 
 type lokiState struct {
+	// LogChan decouples application logging from network latency; stop/done
+	// coordinate drain completion, while stopOnce prevents double close.
 	level      slog.Level
 	url        string
 	service    string
@@ -250,10 +268,12 @@ func newLokiHandler(cfg Config) *lokiHandler {
 	return &lokiHandler{state: state}
 }
 
+// Enabled reports whether Loki is configured and accepts the requested level.
 func (h *lokiHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return h.state.url != "" && level >= h.state.level
 }
 
+// Handle serializes a record and performs a non-blocking enqueue to Loki.
 func (h *lokiHandler) Handle(_ context.Context, record slog.Record) error {
 	if h.state.url == "" {
 		return nil
@@ -311,6 +331,7 @@ func (h *lokiHandler) Close(ctx context.Context) error {
 	return nil
 }
 
+// run batches queued records and drains the channel before signaling done.
 func (s *lokiState) run() {
 	ticker := time.NewTicker(s.flushEvery)
 	defer ticker.Stop()
@@ -348,6 +369,7 @@ func (s *lokiState) run() {
 	}
 }
 
+// push sends one batch to Loki using the state's cancellable HTTP context.
 func (s *lokiState) push(entries []lokiEntry) error {
 	values := make([][]string, 0, len(entries))
 	for _, entry := range entries {

@@ -1,9 +1,11 @@
+// Package metrics defines the process-local Prometheus collectors shared by
+// API and worker services for queue depth, throughput, failures, and latency.
 package metrics
 
 import "github.com/prometheus/client_golang/prometheus"
 
-// Metrics contains process-wide job and worker metrics. The Prometheus client
-// types are safe for concurrent updates.
+// Metrics contains job and worker metrics. Prometheus collectors are safe for
+// concurrent updates, allowing every worker goroutine to record directly.
 type Metrics struct {
 	Registry      *prometheus.Registry
 	JobProcessed  prometheus.Counter
